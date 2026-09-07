@@ -8,10 +8,99 @@ A RESTful API for a Job Marketplace system built with **Node.js**, **Express**, 
 
 - **Runtime:** Node.js (v18+; tested on Node.js v25)
 - **Framework:** Express 5
-- **Language:** TypeScript 7
+- **Language:** TypeScript 5 / 7
 - **Runtime Transpiler & Dev Server:** `tsx` + `nodemon`
-- **Validation:** Zod
-- **Testing:** Jest + `@swc/jest`
+- **Validation:** Zod (runtime request schema validation)
+- **Testing:** Jest + `@swc/jest` / `ts-jest`
+
+---
+
+## 🏛 Design Overview
+
+The application follows a **3-Tier Layered Architecture** with strict **Separation of Concerns (SoC)** and adheres to the **Dependency Inversion Principle (DIP)**:
+
+### 1. Transport / Controller Layer (`src/controllers`, `src/routes`, `src/middleware`)
+- Routes incoming HTTP requests to controller handlers.
+- Validates query strings, parameters, and JSON payloads against schema definitions using Zod before invoking domain logic.
+- Translates domain responses and custom domain errors into standard HTTP status codes (`200`, `201`, `400`, `404`, `422`).
+
+### 2. Domain / Service Layer (`src/services`, `src/models`)
+- Houses pure business logic and enforces domain invariants.
+- Guards state transitions (e.g., ensuring applications cannot be submitted to `CLOSED` jobs, and preventing closed jobs from reopening).
+- Independent of Express and any HTTP-specific constructs.
+
+### 3. Data Access / Repository Layer (`src/repositories`)
+- Abstractions (`IJobRepository`, `IApplicationRepository`) define data access contracts.
+- Concrete implementations (`InMemoryJobRepository`, `InMemoryApplicationRepository`) handle thread-safe, in-memory state manipulation using Maps and arrays.
+- Decoupled via **Dependency Injection (DI)** so that the storage mechanism can be swapped to an SQL/NoSQL database without modifying the service layer.
+
+---
+
+## 📊 Architecture & Data Flow Diagrams
+
+### 1. System Architecture Diagram
+
+```mermaid
+flowchart TD
+    Client["HTTP Client / Frontend"] -->|JSON Requests| Router["Express Router & Validation Middleware"]
+    Router -->|Validated DTOs via Zod| Controller["JobController"]
+    Controller -->|Domain Calls| Service["JobService"]
+    Service -->|IJobRepository Interface| JobRepo[("InMemoryJobRepository")]
+    Service -->|IApplicationRepository Interface| AppRepo[("InMemoryApplicationRepository")]
+```
+
+### 2. Entity Relationship Diagram (ERD)
+
+```mermaid
+erDiagram
+    JOB ||--o{ APPLICATION : "receives (1:N)"
+    JOB {
+        string id PK "UUIDv4"
+        string title
+        string description
+        string location
+        string status "OPEN | CLOSED"
+        datetime createdAt
+        datetime updatedAt
+    }
+    APPLICATION {
+        string id PK "UUIDv4"
+        string jobId FK "References JOB(id)"
+        string candidateName
+        string candidateEmail
+        datetime submittedAt
+    }
+```
+
+### 3. Application Submission Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Candidate / Client
+    participant C as JobController
+    participant S as JobService
+    participant JR as JobRepository
+    participant AR as ApplicationRepository
+
+    Client->>C: POST /api/v1/jobs/:id/applications (Payload)
+    C->>C: Validate Payload via Zod Middleware
+    C->>S: submitApplication(jobId, dto)
+    S->>JR: findById(jobId)
+    JR-->>S: Job entity (or null)
+    alt Job Not Found
+        S-->>C: throw NotFoundError (404)
+        C-->>Client: 404 Not Found
+    else Job is CLOSED
+        S-->>C: throw JobClosedError (422)
+        C-->>Client: 422 Unprocessable Entity
+    else Job is OPEN
+        S->>AR: create(Application)
+        AR-->>S: Persisted Application
+        S-->>C: Application entity
+        C-->>Client: 201 Created (Application JSON)
+    end
+```
 
 ---
 
@@ -119,31 +208,13 @@ npm test
 npm test job.service.test.ts
 ```
 
-Or using `npx jest`:
-
-```bash
-npx jest tests/job.service.test.ts
-```
-
 ### Run Tests in Watch Mode
-
-Reruns tests automatically whenever source or test files change:
 
 ```bash
 npm test -- --watch
 ```
 
-### Run Tests with Verbose Details
-
-Outputs the status of each individual test case:
-
-```bash
-npm test -- --verbose
-```
-
-### Run Tests with Code Coverage
-
-Generates a test coverage summary in the terminal:
+### Run Tests with Coverage Report
 
 ```bash
 npm test -- --coverage
@@ -152,6 +223,7 @@ npm test -- --coverage
 ### Summary of Test Cases Covered
 
 The test suite in `tests/job.service.test.ts` validates:
+
 - **Job Lifecycle:**
   - `should create an open job`: Creates a job with default status `OPEN`.
   - `should close an open job`: Transitions a job status from `OPEN` to `CLOSED`.
@@ -316,15 +388,43 @@ Base URL: `http://localhost:3000/api/v1/jobs`
 
 ## 🛡 Business Rules & Error Handling
 
-1. **Job Status Guard**: Newly created jobs start in `OPEN` status.
-2. **Application Restriction**: Candidates can only apply to jobs in `OPEN` status. Submitting to a `CLOSED` job returns a `422 Unprocessable Entity` (`JobClosedError`).
-3. **Idempotent Closure Guard**: Attempting to close a job that is already `CLOSED` returns a `400 Bad Request` (`BadRequestError`).
-4. **Validation**: All incoming requests are validated against strict Zod schemas. Invalid payloads return HTTP `400` with descriptive error messages.
-5. **Centralized Error Handling**: Any operational or unexpected errors are caught by Express middleware and formatted into a consistent JSON response:
-   ```json
-   {
-     "error": "ErrorName",
-     "message": "Detailed error message"
-   }
-   ```
+1. **Default Job State:** Newly posted jobs initialize with status `OPEN`.
+2. **One-Way Terminal State:** Closing a job is a terminal operation. A `CLOSED` job cannot accept applications, nor can it be reopened.
+3. **Application Invariant:** The service verifies both job existence and status before persisting an application. If `CLOSED`, it rejects the request with `JobClosedError` (`422 Unprocessable Entity`).
+4. **Idempotent Closure Guard:** Attempting to close a job that is already `CLOSED` raises a `BadRequestError` (`400 Bad Request`).
+5. **Strict Boundary Validation:** Incoming JSON bodies and query parameters are pre-screened with Zod. Invalid payloads return HTTP `400` with detailed error fields before reaching service handlers.
+6. **Centralized Error Handling:** Custom domain errors subclassing `AppError` map automatically to standard HTTP status codes.
 
+---
+
+## 💡 Assumptions
+
+1. **Storage Persistence Lifecycle:** Data is stored in memory (`Map` and native arrays) and is intended for local execution and automated testing. In-memory data resets upon server restart.
+2. **Authentication & Authorization:** In alignment with project specifications, authentication (e.g., JWT, OAuth2) and role-based access control (RBAC separating Recruiters from Candidates) were intentionally omitted.
+3. **Job Closure Immutability:** Once a job is marked `CLOSED`, it represents an expired listing and cannot be reverted back to `OPEN`. Existing applications remain viewable by recruiters.
+4. **Identity Generation:** Entities utilize cryptographically secure `UUIDv4` strings for IDs, eliminating ID guessing and auto-increment race conditions.
+5. **Application Submissions:** Candidates may submit multiple applications to different jobs. Candidate emails are normalized to lowercase to maintain data consistency.
+
+---
+
+## 🚀 What I'd Improve with More Time
+
+Given additional time to take this application toward enterprise production readiness, the following enhancements would be prioritized:
+
+### 1. Persistent Storage & ACID Concurrency Control
+- **Database Integration:** Replace in-memory repositories with PostgreSQL using Prisma ORM or Kysely.
+- **Race Condition Prevention:** Under high concurrency, an applicant might submit an application while an admin closes the job simultaneously. Using SQL transactions with row-level locking (`SELECT ... FOR UPDATE`) or Optimistic Concurrency Control (version column) guarantees that an application cannot be committed against a concurrently closed job.
+
+### 2. Scalability & Pagination
+- Implement cursor-based pagination (e.g., `?cursor=xyz&limit=20`) for `GET /api/v1/jobs` and `GET /api/v1/jobs/:id/applications` to avoid large in-memory memory spikes on high-volume datasets.
+
+### 3. Idempotency & Deduplication
+- **Duplicate Protection:** Enforce a composite unique constraint (`jobId`, `candidateEmail`) or use Redis-based idempotency keys on `POST /applications` to protect against duplicate double-clicks or client retries.
+
+### 4. Interactive Documentation & E2E Integration Testing
+- Integrate Swagger / OpenAPI documentation (via `tsoa` or `swagger-ui-express`) so consumers can test and inspect schemas interactively.
+- Add an end-to-end integration test suite using Supertest to test route handlers and HTTP status codes alongside existing unit tests.
+
+### 5. Production Observability & Async Processing
+- Add structured JSON logging (via Pino or Winston) and attach correlation IDs (`x-request-id`) across middleware for distributed tracing.
+- Offload non-critical side effects (e.g., sending email confirmations to candidates) to an asynchronous background job queue (e.g., BullMQ with Redis).
